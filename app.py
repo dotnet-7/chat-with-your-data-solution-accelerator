@@ -1,6 +1,8 @@
 import json
 import os
 import logging
+import time
+
 import requests
 import openai
 
@@ -12,16 +14,19 @@ mimetypes.add_type('text/css', '.css')
 
 from flask import Flask, Response, request, jsonify
 from dotenv import load_dotenv
-from backend.utilities.QuestionHandler import QuestionHandler
 
 load_dotenv()
 
 app = Flask(__name__)
 
+
 @app.route("/", defaults={"path": "index.html"})
 @app.route("/<path:path>")
 def static_file(path):
     return app.send_static_file(path)
+
+AUTH_TYPE = os.environ.get("AUTH_TYPE", "rbac")
+USE_RBAC = True if AUTH_TYPE.lower() == "rbac" else False
 
 # ACS Integration Settings
 AZURE_SEARCH_SERVICE = os.environ.get("AZURE_SEARCH_SERVICE")
@@ -44,32 +49,60 @@ AZURE_OPENAI_TEMPERATURE = os.environ.get("AZURE_OPENAI_TEMPERATURE", 0)
 AZURE_OPENAI_TOP_P = os.environ.get("AZURE_OPENAI_TOP_P", 1.0)
 AZURE_OPENAI_MAX_TOKENS = os.environ.get("AZURE_OPENAI_MAX_TOKENS", 1000)
 AZURE_OPENAI_STOP_SEQUENCE = os.environ.get("AZURE_OPENAI_STOP_SEQUENCE")
-AZURE_OPENAI_SYSTEM_MESSAGE = os.environ.get("AZURE_OPENAI_SYSTEM_MESSAGE", "You are an AI assistant that helps people find information.")
+AZURE_OPENAI_SYSTEM_MESSAGE = os.environ.get("AZURE_OPENAI_SYSTEM_MESSAGE",
+                                             "You are an AI assistant that helps people find information.")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-06-01-preview")
 AZURE_OPENAI_STREAM = os.environ.get("AZURE_OPENAI_STREAM", "true")
-AZURE_OPENAI_MODEL_NAME = os.environ.get("AZURE_OPENAI_MODEL_NAME", "gpt-35-turbo") # Name of the model, e.g. 'gpt-35-turbo' or 'gpt-4'
+AZURE_OPENAI_MODEL_NAME = os.environ.get("AZURE_OPENAI_MODEL_NAME",
+                                         "gpt-35-turbo")  # Name of the model, e.g. 'gpt-35-turbo' or 'gpt-4'
 
 SHOULD_STREAM = True if AZURE_OPENAI_STREAM.lower() == "true" else False
+
+openai.api_key = AZURE_OPENAI_KEY
+openai.api_version = "2023-09-01-preview"
+openai.api_base = f"https://{AZURE_OPENAI_RESOURCE}.openai.azure.com/"
+openai.api_type = "azure"
+
+def setup_adapter(deployment_id):
+
+    class CustomAdapter(requests.adapters.HTTPAdapter):
+
+        def send(self, request, **kwargs):
+            request.url = f"{openai.api_base}/openai/deployments/{deployment_id}/extensions/chat/completions?api-version={openai.api_version}"
+            return super().send(request, **kwargs)
+
+    session = requests.Session()
+
+    session.mount(
+        prefix=f"{openai.api_base}/openai/deployments/{deployment_id}",
+        adapter=CustomAdapter()
+    )
+
+    openai.requestssession = session
+
 
 def is_chat_model():
     if 'gpt-4' in AZURE_OPENAI_MODEL_NAME.lower():
         return True
     return False
 
+
 def should_use_data():
     if AZURE_SEARCH_SERVICE and AZURE_SEARCH_INDEX and AZURE_SEARCH_KEY:
         return True
     return False
 
+
 def prepare_body_headers_with_data(request):
     request_messages = request.json["messages"]
 
     body = {
+        "deployment_id": AZURE_OPENAI_MODEL,
         "messages": request_messages,
         "temperature": AZURE_OPENAI_TEMPERATURE,
         "max_tokens": AZURE_OPENAI_MAX_TOKENS,
         "top_p": AZURE_OPENAI_TOP_P,
-        "stop": AZURE_OPENAI_STOP_SEQUENCE.split("|") if AZURE_OPENAI_STOP_SEQUENCE else [],
+        # "stop": AZURE_OPENAI_STOP_SEQUENCE.split("|") if AZURE_OPENAI_STOP_SEQUENCE else [],
         "stream": SHOULD_STREAM,
         "dataSources": [
             {
@@ -93,25 +126,25 @@ def prepare_body_headers_with_data(request):
             }
         ]
     }
-    
+
     chatgpt_url = f"https://{AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/deployments/{AZURE_OPENAI_MODEL}"
     if is_chat_model():
         chatgpt_url += "/chat/completions?api-version=2023-03-15-preview"
     else:
         chatgpt_url += "/completions?api-version=2023-03-15-preview"
 
-    headers = {
-        'Content-Type': 'application/json',
-        'api-key': AZURE_OPENAI_KEY,
-        'chatgpt_url': chatgpt_url,
-        'chatgpt_key': AZURE_OPENAI_KEY,
-        "x-ms-useragent": "GitHubSampleWebApp/PublicAPI/1.0.0"
-    }
+    # headers = {
+    #     'Content-Type': 'application/json',
+    #     'api-key': AZURE_OPENAI_KEY,
+    #     'chatgpt_url': chatgpt_url,
+    #     'chatgpt_key': AZURE_OPENAI_KEY,
+    #     "x-ms-useragent": "GitHubSampleWebApp/PublicAPI/1.0.0"
+    # }
 
-    return body, headers
+    return body
 
 
-def stream_with_data(body, headers, endpoint):
+def stream_with_data(body):
     s = requests.Session()
     response = {
         "id": "",
@@ -123,50 +156,83 @@ def stream_with_data(body, headers, endpoint):
         }]
     }
     try:
-        with s.post(endpoint, json=body, headers=headers, stream=True) as r:
-            for line in r.iter_lines(chunk_size=10):
-                if line:
-                    lineJson = json.loads(line.lstrip(b'data:').decode('utf-8'))
-                    if 'error' in lineJson:
-                        yield json.dumps(lineJson).replace("\n", "\\n") + "\n"
-                    response["id"] = lineJson["id"]
-                    response["model"] = lineJson["model"]
-                    response["created"] = lineJson["created"]
-                    response["object"] = lineJson["object"]
+        setup_adapter(AZURE_OPENAI_MODEL)
+        completion = openai.ChatCompletion.create(**body)
+        for line in completion:
+            if line:
+                lineJson = json.loads(str(line))
+                if 'error' in lineJson:
+                    yield json.dumps(lineJson).replace("\n", "\\n") + "\n"
+                response["id"] = lineJson["id"]
+                response["model"] = lineJson["model"]
+                response["created"] = lineJson["created"]
+                response["object"] = lineJson["object"]
+                if 'context' in lineJson["choices"][0]["delta"]:
+                    response["choices"][0]["messages"].append(lineJson["choices"][0]["delta"]['context']["messages"])
+                elif 'role' in lineJson["choices"][0]["delta"]:
+                    response["choices"][0]["messages"].append({
+                        "role": "assistant",
+                        "content": ""
+                    })
+                else:
+                    if not lineJson["choices"][0]["finish_reason"] == "stop":
+                        deltaText = lineJson["choices"][0]["delta"]['content']
+                        response["choices"][0]["messages"][1]["content"] += deltaText
+                # print(json.dumps(response).replace("\n", "\\n") + "\n")
+                yield json.dumps(response).replace("\n", "\\n") + "\n"
 
-                    role = lineJson["choices"][0]["messages"][0]["delta"].get("role")
-                    if role == "tool":
-                        response["choices"][0]["messages"].append(lineJson["choices"][0]["messages"][0]["delta"])
-                    elif role == "assistant": 
-                        response["choices"][0]["messages"].append({
-                            "role": "assistant",
-                            "content": ""
-                        })
-                    else:
-                        deltaText = lineJson["choices"][0]["messages"][0]["delta"]["content"]
-                        if deltaText != "[DONE]":
-                            response["choices"][0]["messages"][1]["content"] += deltaText                
 
-                    yield json.dumps(response).replace("\n", "\\n") + "\n"
+
+        # with s.post(endpoint, json=body, headers=headers, stream=True) as r:
+        #     for line in r.iter_lines(chunk_size=10):
+        #         if line:
+        #             lineJson = json.loads(line.lstrip(b'data:').decode('utf-8'))
+        #             if 'error' in lineJson:
+        #                 yield json.dumps(lineJson).replace("\n", "\\n") + "\n"
+        #             response["id"] = lineJson["id"]
+        #             response["model"] = lineJson["model"]
+        #             response["created"] = lineJson["created"]
+        #             response["object"] = lineJson["object"]
+        #
+        #             role = lineJson["choices"][0]["messages"][0]["delta"].get("role")
+        #             if role == "tool":
+        #                 response["choices"][0]["messages"].append(lineJson["choices"][0]["messages"][0]["delta"])
+        #             elif role == "assistant":
+        #                 response["choices"][0]["messages"].append({
+        #                     "role": "assistant",
+        #                     "content": ""
+        #                 })
+        #             else:
+        #                 deltaText = lineJson["choices"][0]["messages"][0]["delta"]["content"]
+        #                 if deltaText != "[DONE]":
+        #                     response["choices"][0]["messages"][1]["content"] += deltaText
+        #             # print(json.dumps(response).replace("\n", "\\n") + "\n")
+        #             yield json.dumps(response).replace("\n", "\\n") + "\n"
     except Exception as e:
         yield json.dumps({"error": str(e)}).replace("\n", "\\n") + "\n"
 
 
 def conversation_with_data(request):
-    body, headers = prepare_body_headers_with_data(request)
-    endpoint = f"https://{AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/deployments/{AZURE_OPENAI_MODEL}/extensions/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
-    
-    if not SHOULD_STREAM:
-        r = requests.post(endpoint, headers=headers, json=body)
-        status_code = r.status_code
-        r = r.json()
+    body = prepare_body_headers_with_data(request)
+    # endpoint = f"https://{AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/deployments/{AZURE_OPENAI_MODEL}/extensions/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
 
-        return Response(json.dumps(r).replace("\n", "\\n"), status=status_code)
+
+
+    if not SHOULD_STREAM:
+        setup_adapter(AZURE_OPENAI_MODEL)
+        completion = openai.ChatCompletion.create(**body)
+        return jsonify(completion), 200
+        # r = requests.post(endpoint, headers=headers, json=body)
+        # status_code = r.status_code
+        # r = r.json()
+        # return Response(json.dumps(r).replace("\n", "\\n"), status=status_code)
+
     else:
         if request.method == "POST":
-            return Response(stream_with_data(body, headers, endpoint), mimetype='text/event-stream')
+            return Response(stream_with_data(body), mimetype='text/event-stream')
         else:
             return Response(None, mimetype='text/event-stream')
+
 
 def stream_without_data(response):
     responseText = ""
@@ -206,17 +272,17 @@ def conversation_without_data(request):
 
     for message in request_messages:
         messages.append({
-            "role": message["role"] ,
+            "role": message["role"],
             "content": message["content"]
         })
 
     response = openai.ChatCompletion.create(
         engine=AZURE_OPENAI_MODEL,
-        messages = messages,
+        messages=messages,
         temperature=float(AZURE_OPENAI_TEMPERATURE),
         max_tokens=int(AZURE_OPENAI_MAX_TOKENS),
         top_p=float(AZURE_OPENAI_TOP_P),
-        stop=AZURE_OPENAI_STOP_SEQUENCE.split("|") if AZURE_OPENAI_STOP_SEQUENCE else None,
+        # stop=AZURE_OPENAI_STOP_SEQUENCE.split("|") if AZURE_OPENAI_STOP_SEQUENCE else None,
         stream=SHOULD_STREAM
     )
 
@@ -241,6 +307,7 @@ def conversation_without_data(request):
         else:
             return Response(None, mimetype='text/event-stream')
 
+
 @app.route("/api/conversation/azure_byod", methods=["GET", "POST"])
 def conversation_azure_byod():
     try:
@@ -252,23 +319,26 @@ def conversation_azure_byod():
     except Exception as e:
         logging.exception("Exception in /api/conversation/azure_byod")
         return jsonify({"error": str(e)}), 500
-    
 
-@app.route("/api/conversation/custom", methods=["GET","POST"])
+
+@app.route("/api/conversation/custom", methods=["GET", "POST"])
 def conversation_custom():
     from backend.utilities.helpers.OrchestratorHelper import Orchestrator, OrchestrationSettings
     message_orchestrator = Orchestrator()
-    
+
     try:
         user_message = request.json["messages"][-1]['content']
         conversation_id = request.json["conversation_id"]
-        user_assistent_messages = list(filter(lambda x: x['role'] in ('user','assistant'), request.json["messages"][0:-1]))        
+        user_assistent_messages = list(
+            filter(lambda x: x['role'] in ('user', 'assistant'), request.json["messages"][0:-1]))
         chat_history = []
-        for i,k in enumerate(user_assistent_messages):
+        for i, k in enumerate(user_assistent_messages):
             if i % 2 == 0:
-                chat_history.append((user_assistent_messages[i]['content'],user_assistent_messages[i+1]['content']))
+                chat_history.append((user_assistent_messages[i]['content'], user_assistent_messages[i + 1]['content']))
         from backend.utilities.helpers.ConfigHelper import ConfigHelper
-        messages = message_orchestrator.handle_message(user_message=user_message, chat_history=chat_history, conversation_id=conversation_id, orchestrator=ConfigHelper.get_active_config_or_default().orchestrator)
+        messages = message_orchestrator.handle_message(user_message=user_message, chat_history=chat_history,
+                                                       conversation_id=conversation_id,
+                                                       orchestrator=ConfigHelper.get_active_config_or_default().orchestrator)
 
         response_obj = {
             "id": "response.id",
@@ -280,11 +350,17 @@ def conversation_custom():
             }]
         }
 
-        return jsonify(response_obj), 200    
-    
+        return jsonify(response_obj), 200
+
     except Exception as e:
         logging.exception("Exception in /api/conversation/custom")
         return jsonify({"error": str(e)}), 500
 
+
 if __name__ == "__main__":
     app.run()
+
+
+
+
+
